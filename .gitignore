@@ -12,9 +12,6 @@ Cargo.lock
 *.swo
 *~
 
-# Image assets
-crosshair.png
-assets/crosshair.png
 
 # Temp files
 *.tmp
