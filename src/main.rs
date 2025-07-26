@@ -63,12 +63,13 @@ struct AppState {
     prev_selection_state: SelectionState,
     needs_redraw: bool,
 
-    // Buffer reuse for overlay
+    // Double buffering for overlay
     canvas_data: Option<Vec<u8>>,
-    shm_file: Option<std::fs::File>,
-    shm_pool: Option<wl_shm_pool::WlShmPool>,
-    buffer: Option<wl_buffer::WlBuffer>,
-    mmap: Option<memmap2::MmapMut>,
+    shm_files: [Option<std::fs::File>; 2],
+    shm_pools: [Option<wl_shm_pool::WlShmPool>; 2],
+    buffers: [Option<wl_buffer::WlBuffer>; 2],
+    mmaps: [Option<memmap2::MmapMut>; 2],
+    active_buffer: usize,
 }
 
 impl AppState {
@@ -93,10 +94,11 @@ impl AppState {
             prev_selection_state: SelectionState::Idle,
             needs_redraw: true,
             canvas_data: None,
-            shm_file: None,
-            shm_pool: None,
-            buffer: None,
-            mmap: None,
+            shm_files: [None, None],
+            shm_pools: [None, None],
+            buffers: [None, None],
+            mmaps: [None, None],
+            active_buffer: 0,
         }
     }
 }
@@ -367,35 +369,35 @@ fn draw_frame(state: &mut AppState, qh: &QueueHandle<AppState>) {
         }
     }
 
-    // Create shared memory pool, buffer, and mmap once
-    if state.shm_file.is_none() || state.shm_pool.is_none() || state.buffer.is_none() || state.mmap.is_none() {
-        use std::os::unix::io::AsRawFd;
-        let shm = state.shm.as_ref().unwrap();
-        let stride = width * 4;
-        let size = (stride * height) as i32;
-
-        // Create a temp file for shared memory
-        let file = tempfile::tempfile().expect("Failed to create shm file");
-        file.set_len(size as u64).expect("Failed to set shm file size");
-        let fd = unsafe { BorrowedFd::borrow_raw(file.as_raw_fd()) };
-
-        let pool = shm.create_pool(fd, size, qh, ());
-        let buffer = pool.create_buffer(0, width as i32, height as i32, stride as i32, wl_shm::Format::Argb8888, qh, ());
-
-        let mmap = unsafe { memmap2::MmapMut::map_mut(&file).expect("Failed to mmap shm file") };
-
-        state.shm_file = Some(file);
-        state.shm_pool = Some(pool);
-        state.buffer = Some(buffer);
-        state.mmap = Some(mmap);
+    // Create shared memory pool, buffer, and mmap for both buffers if needed
+    use std::os::unix::io::AsRawFd;
+    let shm = state.shm.as_ref().unwrap();
+    let stride = width * 4;
+    let size = (stride * height) as i32;
+    for i in 0..2 {
+        if state.shm_files[i].is_none() || state.shm_pools[i].is_none() || state.buffers[i].is_none() || state.mmaps[i].is_none() {
+            let file = tempfile::tempfile().expect("Failed to create shm file");
+            file.set_len(size as u64).expect("Failed to set shm file size");
+            let fd = unsafe { BorrowedFd::borrow_raw(file.as_raw_fd()) };
+            let pool = shm.create_pool(fd, size, qh, ());
+            let buffer = pool.create_buffer(0, width as i32, height as i32, stride as i32, wl_shm::Format::Argb8888, qh, ());
+            let mmap = unsafe { memmap2::MmapMut::map_mut(&file).expect("Failed to mmap shm file") };
+            state.shm_files[i] = Some(file);
+            state.shm_pools[i] = Some(pool);
+            state.buffers[i] = Some(buffer);
+            state.mmaps[i] = Some(mmap);
+        }
     }
 
-    // Write canvas_data to mmap
-    let mmap = state.mmap.as_mut().unwrap();
+    // Write canvas_data to the inactive buffer's mmap
+    let inactive = (state.active_buffer + 1) % 2;
+    let mmap = state.mmaps[inactive].as_mut().unwrap();
     mmap[..canvas_data.len()].copy_from_slice(canvas_data);
     mmap.flush().expect("Failed to flush mmap");
 
-    let buffer = state.buffer.as_ref().unwrap();
+    // Swap buffers and display
+    state.active_buffer = inactive;
+    let buffer = state.buffers[state.active_buffer].as_ref().unwrap();
     surface.attach(Some(buffer), 0, 0);
     surface.damage_buffer(0, 0, width as i32, height as i32);
     surface.commit();
@@ -429,10 +431,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.surface = Some(surface);
     state.layer_surface = Some(layer_surface);
     state.canvas_data = None;
-    state.shm_file = None;
-    state.shm_pool = None;
-    state.buffer = None;
-    state.mmap = None;
+    state.shm_files = [None, None];
+    state.shm_pools = [None, None];
+    state.buffers = [None, None];
+    state.mmaps = [None, None];
+    state.active_buffer = 0;
 
     let png_bytes = include_bytes!("../assets/crosshair.png");
     let img = image::load_from_memory(png_bytes)?.to_rgba8();
