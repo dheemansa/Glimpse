@@ -4,20 +4,20 @@
 
 ## Proposed File Structure
 
-src/
-├── main.rs              // Entry point, connection setup, main event loop
-├── app.rs               // AppState struct and high-level application logic
-├── wayland/
-│   ├── mod.rs           // Re-exports and common Wayland utilities
-│   ├── dispatch.rs      // All Dispatch trait implementations
-│   └── globals.rs       // Global binding and registry handling
-├── graphics/
-│   ├── mod.rs           // Re-exports for graphics components
-│   ├── buffer.rs        // Buffer creation, mmap management, double buffering
-│   ├── drawing.rs       // Pixel manipulation, dirty region tracking
-│   └── cursor.rs        // Cursor loading and management
-├── selection.rs         // Selection state machine and geometry calculations
-└── config.rs            // Constants, configuration (optional)
+src/<br>
+├── main.rs              // Entry point, connection setup, main event loop<br>
+├── app.rs               // AppState struct and high-level application logic<br>
+├── wayland/<br>
+│   ├── mod.rs           // Re-exports and common Wayland utilities<br>
+│   ├── dispatch.rs      // All Dispatch trait implementations<br>
+│   └── globals.rs       // Global binding and registry handling<br>
+├── graphics/<br>
+│   ├── mod.rs           // Re-exports for graphics components<br>
+│   ├── buffer.rs        // Buffer creation, mmap management, double buffering<br>
+│   ├── drawing.rs       // Pixel manipulation, dirty region tracking<br>
+│   └── cursor.rs        // Cursor loading and management<br>
+├── selection.rs         // Selection state machine and geometry calculations<br>
+└── config.rs            // Constants, configuration (optional)<br>
 
 ## Refactoring & Structure
 - [ ] Split code into modules (see proposed src/ structure)
