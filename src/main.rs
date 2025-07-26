@@ -70,6 +70,7 @@ struct AppState {
     buffers: [Option<wl_buffer::WlBuffer>; 2],
     mmaps: [Option<memmap2::MmapMut>; 2],
     active_buffer: usize,
+    prev_selection_rect: Option<(u32, u32, u32, u32)>, // (min_x, min_y, max_x, max_y)
 }
 
 impl AppState {
@@ -99,6 +100,7 @@ impl AppState {
             buffers: [None, None],
             mmaps: [None, None],
             active_buffer: 0,
+            prev_selection_rect: None,
         }
     }
 }
@@ -235,9 +237,46 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for AppState {
              qh: &QueueHandle<Self>,
     ) {
         if let zwlr_layer_surface_v1::Event::Configure { serial, width, height } = event {
+            let size_changed = state.width != width || state.height != height;
             state.width = width;
             state.height = height;
             surf.ack_configure(serial);
+            if size_changed {
+                // Clean up old resources first
+                for i in 0..2 {
+                    if let Some(pool) = state.shm_pools[i].take() {
+                        pool.destroy();
+                    }
+                    // Files and mmaps will be dropped automatically when replaced
+                    state.shm_files[i] = None;
+                    state.buffers[i] = None;
+                    state.mmaps[i] = None;
+                }
+                // Allocate canvas_data and double buffers only if size changed and size is valid
+                if width > 0 && height > 0 {
+                    let buffer_size = (width * height * 4) as usize;
+                    state.canvas_data = Some(vec![0; buffer_size]);
+                    use std::os::unix::io::AsRawFd;
+                    let shm = state.shm.as_ref().unwrap();
+                    let stride = width * 4;
+                    let size = (stride * height) as i32;
+                    for i in 0..2 {
+                        let file = tempfile::tempfile().expect("Failed to create shm file");
+                        file.set_len(size as u64).expect("Failed to set shm file size");
+                        let fd = unsafe { BorrowedFd::borrow_raw(file.as_raw_fd()) };
+                        let pool = shm.create_pool(fd, size, qh, ());
+                        let buffer = pool.create_buffer(0, width as i32, height as i32, stride as i32, wl_shm::Format::Argb8888, qh, ());
+                        let mmap = unsafe { memmap2::MmapMut::map_mut(&file).expect("Failed to mmap shm file") };
+                        state.shm_files[i] = Some(file);
+                        state.shm_pools[i] = Some(pool);
+                        state.buffers[i] = Some(buffer);
+                        state.mmaps[i] = Some(mmap);
+                    }
+                    state.active_buffer = 0;
+                } else {
+                    state.canvas_data = None;
+                }
+            }
             draw_frame(state, qh);
         } else if let zwlr_layer_surface_v1::Event::Closed = event {
             state.running = false;
@@ -286,28 +325,38 @@ fn create_buffer_from_data(
 
 /// Draws the overlay and the current selection rectangle.
 fn draw_frame(state: &mut AppState, qh: &QueueHandle<AppState>) {
-    let surface = state.surface.as_ref().unwrap();
+    let surface = match state.surface.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
     let width = state.width;
     let height = state.height;
 
-    if width == 0 || height == 0 { return; }
+    // Check for valid size and buffer initialization
+    if width == 0 || height == 0 || state.buffers[0].is_none() || state.buffers[1].is_none() || state.mmaps[0].is_none() || state.mmaps[1].is_none() || state.canvas_data.is_none() {
+        return;
+    }
 
-    let buffer_size = (width * height * 4) as usize;
     let semi_transparent_black = [0x00, 0x00, 0x00, 0x80]; // BGRA
     let fully_transparent = [0x00, 0x00, 0x00, 0x00];
-
-    // Allocate canvas_data once
-    if state.canvas_data.is_none() || state.canvas_data.as_ref().unwrap().len() != buffer_size {
-        state.canvas_data = Some(vec![0; buffer_size]);
-    }
     let canvas_data = state.canvas_data.as_mut().unwrap();
 
-    // Fill the background
-    for chunk in canvas_data.chunks_exact_mut(4) {
-        chunk.copy_from_slice(&semi_transparent_black);
+    // Track previous and current selection rectangles, union for dirty region
+    let mut dirty_min_x = width;
+    let mut dirty_min_y = height;
+    let mut dirty_max_x = 0;
+    let mut dirty_max_y = 0;
+    let mut curr_rect = None;
+
+    // Previous selection rectangle
+    if let Some((old_min_x, old_min_y, old_max_x, old_max_y)) = state.prev_selection_rect {
+        dirty_min_x = dirty_min_x.min(old_min_x);
+        dirty_min_y = dirty_min_y.min(old_min_y);
+        dirty_max_x = dirty_max_x.max(old_max_x);
+        dirty_max_y = dirty_max_y.max(old_max_y);
     }
 
-    // If selecting, draw the selection rectangle and its border
+    // Current selection rectangle
     if let SelectionState::Selecting { start } = state.selection_state {
         let (x1, y1) = start;
         let (x2, y2) = state.current_pos;
@@ -316,6 +365,49 @@ fn draw_frame(state: &mut AppState, qh: &QueueHandle<AppState>) {
         let max_x = x1.max(x2).min(width as i32) as u32;
         let min_y = y1.min(y2).max(0) as u32;
         let max_y = y1.max(y2).min(height as i32) as u32;
+
+        let curr_min_x = min_x.saturating_sub(1);
+        let curr_min_y = min_y.saturating_sub(1);
+        let curr_max_x = (max_x + 1).min(width);
+        let curr_max_y = (max_y + 1).min(height);
+
+        dirty_min_x = dirty_min_x.min(curr_min_x);
+        dirty_min_y = dirty_min_y.min(curr_min_y);
+        dirty_max_x = dirty_max_x.max(curr_max_x);
+        dirty_max_y = dirty_max_y.max(curr_max_y);
+
+        curr_rect = Some((curr_min_x, curr_min_y, curr_max_x, curr_max_y));
+
+        // Save current rectangle for next frame
+        state.prev_selection_rect = Some((curr_min_x, curr_min_y, curr_max_x, curr_max_y));
+    } else {
+        state.prev_selection_rect = None;
+    }
+
+    // If no selection and no previous, dirty region is whole screen
+    if dirty_max_x <= dirty_min_x || dirty_max_y <= dirty_min_y {
+        dirty_min_x = 0;
+        dirty_min_y = 0;
+        dirty_max_x = width;
+        dirty_max_y = height;
+    }
+
+    // Fill background only in dirty region
+    for y in dirty_min_y..dirty_max_y {
+        for x in dirty_min_x..dirty_max_x {
+            let offset = ((y * width + x) * 4) as usize;
+            if offset + 3 < canvas_data.len() {
+                canvas_data[offset..offset + 4].copy_from_slice(&semi_transparent_black);
+            }
+        }
+    }
+
+    // Draw current selection rectangle and border if present
+    if let Some((curr_min_x, curr_min_y, curr_max_x, curr_max_y)) = curr_rect {
+        let min_x = curr_min_x + 1;
+        let max_x = curr_max_x.saturating_sub(1);
+        let min_y = curr_min_y + 1;
+        let max_y = curr_max_y.saturating_sub(1);
 
         // Draw transparent fill
         for y in min_y..max_y {
@@ -369,37 +461,38 @@ fn draw_frame(state: &mut AppState, qh: &QueueHandle<AppState>) {
         }
     }
 
-    // Create shared memory pool, buffer, and mmap for both buffers if needed
-    use std::os::unix::io::AsRawFd;
-    let shm = state.shm.as_ref().unwrap();
+    // Write only the dirty rectangle region to the inactive buffer's mmap
+    let inactive = (state.active_buffer + 1) % 2;
+    let mmap = match state.mmaps[inactive].as_mut() {
+        Some(m) => m,
+        None => return,
+    };
     let stride = width * 4;
-    let size = (stride * height) as i32;
-    for i in 0..2 {
-        if state.shm_files[i].is_none() || state.shm_pools[i].is_none() || state.buffers[i].is_none() || state.mmaps[i].is_none() {
-            let file = tempfile::tempfile().expect("Failed to create shm file");
-            file.set_len(size as u64).expect("Failed to set shm file size");
-            let fd = unsafe { BorrowedFd::borrow_raw(file.as_raw_fd()) };
-            let pool = shm.create_pool(fd, size, qh, ());
-            let buffer = pool.create_buffer(0, width as i32, height as i32, stride as i32, wl_shm::Format::Argb8888, qh, ());
-            let mmap = unsafe { memmap2::MmapMut::map_mut(&file).expect("Failed to mmap shm file") };
-            state.shm_files[i] = Some(file);
-            state.shm_pools[i] = Some(pool);
-            state.buffers[i] = Some(buffer);
-            state.mmaps[i] = Some(mmap);
+    if dirty_max_x > dirty_min_x && dirty_max_y > dirty_min_y {
+        for y in dirty_min_y..dirty_max_y {
+            let row_start = ((y * width + dirty_min_x) * 4) as usize;
+            let row_size = ((dirty_max_x - dirty_min_x) * 4) as usize;
+            let src = &canvas_data[row_start..row_start + row_size];
+            let dst = &mut mmap[row_start..row_start + row_size];
+            dst.copy_from_slice(src);
         }
     }
-
-    // Write canvas_data to the inactive buffer's mmap
-    let inactive = (state.active_buffer + 1) % 2;
-    let mmap = state.mmaps[inactive].as_mut().unwrap();
-    mmap[..canvas_data.len()].copy_from_slice(canvas_data);
     mmap.flush().expect("Failed to flush mmap");
 
     // Swap buffers and display
     state.active_buffer = inactive;
-    let buffer = state.buffers[state.active_buffer].as_ref().unwrap();
+    let buffer = match state.buffers[state.active_buffer].as_ref() {
+        Some(b) => b,
+        None => return,
+    };
     surface.attach(Some(buffer), 0, 0);
-    surface.damage_buffer(0, 0, width as i32, height as i32);
+    // Only damage the dirty region
+    surface.damage_buffer(
+        dirty_min_x as i32,
+        dirty_min_y as i32,
+        (dirty_max_x - dirty_min_x) as i32,
+        (dirty_max_y - dirty_min_y) as i32,
+    );
     surface.commit();
 }
 
@@ -459,7 +552,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{Instant, Duration};
     println!("Click and drag to select a region. Press ESC to cancel.");
     let mut last_frame = Instant::now();
-    let frame_interval = Duration::from_millis(33); // ~30 FPS
+    //let frame_interval = Duration::from_millis(33); // ~30 FPS
+    let frame_interval = Duration::from_millis(16); // ~60 FPS
     while state.running {
         let now = Instant::now();
         if now.duration_since(last_frame) > frame_interval {
