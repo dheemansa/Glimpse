@@ -71,6 +71,7 @@ struct AppState {
     mmaps: [Option<memmap2::MmapMut>; 2],
     active_buffer: usize,
     prev_selection_rect: Option<(u32, u32, u32, u32)>, // (min_x, min_y, max_x, max_y)
+    background_cache: Option<Vec<u8>>, // Clean background
 }
 
 impl AppState {
@@ -101,6 +102,7 @@ impl AppState {
             mmaps: [None, None],
             active_buffer: 0,
             prev_selection_rect: None,
+            background_cache: None,
         }
     }
 }
@@ -160,6 +162,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
         match event {
             wl_pointer::Event::Enter { serial, surface_x, surface_y, .. } => {
                 state.current_pos = (surface_x as i32, surface_y as i32);
+                // Only redraw on pointer enter if you want cursor feedback (optional)
                 if let Some(cursor_surface) = &state.cursor_surface {
                     let (hx, hy) = state.cursor_hotspot;
                     pointer.set_cursor(serial, Some(cursor_surface), hx, hy);
@@ -167,7 +170,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
             }
             wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
                 state.current_pos = (surface_x as i32, surface_y as i32);
-                if state.selection_state != SelectionState::Idle && (state.current_pos != state.prev_pos || state.selection_state != state.prev_selection_state) {
+                // Only redraw on motion during selection
+                if state.selection_state != SelectionState::Idle &&
+                   (state.current_pos != state.prev_pos || state.selection_state != state.prev_selection_state) {
                     state.needs_redraw = true;
                 }
                 state.prev_pos = state.current_pos;
@@ -195,6 +200,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
                                 let height = (y1 - y2).abs();
 
                                 println!("{},{},{}x{}", x, y, width, height);
+                                // End selection and exit; no redraw needed
                                 state.running = false;
                             }
                         }
@@ -256,6 +262,13 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for AppState {
                 if width > 0 && height > 0 {
                     let buffer_size = (width * height * 4) as usize;
                     state.canvas_data = Some(vec![0; buffer_size]);
+                    // Generate background cache
+                    let mut bg = vec![0; buffer_size];
+                    let semi_transparent_black = [0x00, 0x00, 0x00, 0x80];
+                    for chunk in bg.chunks_exact_mut(4) {
+                        chunk.copy_from_slice(&semi_transparent_black);
+                    }
+                    state.background_cache = Some(bg);
                     use std::os::unix::io::AsRawFd;
                     let shm = state.shm.as_ref().unwrap();
                     let stride = width * 4;
@@ -275,9 +288,10 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for AppState {
                     state.active_buffer = 0;
                 } else {
                     state.canvas_data = None;
+                    state.background_cache = None;
                 }
             }
-            draw_frame(state, qh);
+            state.needs_redraw = true; // Always redraw after configure
         } else if let zwlr_layer_surface_v1::Event::Closed = event {
             state.running = false;
         }
@@ -392,13 +406,14 @@ fn draw_frame(state: &mut AppState, qh: &QueueHandle<AppState>) {
         dirty_max_y = height;
     }
 
-    // Fill background only in dirty region
-    for y in dirty_min_y..dirty_max_y {
-        for x in dirty_min_x..dirty_max_x {
-            let offset = ((y * width + x) * 4) as usize;
-            if offset + 3 < canvas_data.len() {
-                canvas_data[offset..offset + 4].copy_from_slice(&semi_transparent_black);
-            }
+    // Fill background only in dirty region using background_cache
+    if let Some(bg) = &state.background_cache {
+        for y in dirty_min_y..dirty_max_y {
+            let row_start = ((y * width + dirty_min_x) * 4) as usize;
+            let row_size = ((dirty_max_x - dirty_min_x) * 4) as usize;
+            let src = &bg[row_start..row_start + row_size];
+            let dst = &mut canvas_data[row_start..row_start + row_size];
+            dst.copy_from_slice(src);
         }
     }
 
@@ -549,21 +564,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     event_queue.roundtrip(&mut state)?;
 
-    use std::time::{Instant, Duration};
+    // Guarantee initial draw
+    draw_frame(&mut state, &qh);
+
     println!("Click and drag to select a region. Press ESC to cancel.");
-    let mut last_frame = Instant::now();
-    //let frame_interval = Duration::from_millis(33); // ~30 FPS
-    let frame_interval = Duration::from_millis(16); // ~60 FPS
     while state.running {
-        let now = Instant::now();
-        if now.duration_since(last_frame) > frame_interval {
-            if state.needs_redraw {
-                draw_frame(&mut state, &qh);
-                state.needs_redraw = false;
-            }
-            last_frame = now;
-        }
+        // Block for events, redraw only when needed
         event_queue.blocking_dispatch(&mut state)?;
+        if state.needs_redraw {
+            draw_frame(&mut state, &qh);
+            state.needs_redraw = false;
+        }
     }
 
     println!("Exiting.");
