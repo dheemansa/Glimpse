@@ -26,4 +26,5 @@ Cargo.lock
 # Ignore working files
 working(laggy gemini).rs
 working(qwen).rs
-/src/old.rs
+/src/old(v1).rs
+/src/old(v2)(really-smooth).rs
