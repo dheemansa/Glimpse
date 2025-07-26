@@ -1,4 +1,4 @@
-# Wayland Screen Selector Optimization TODO
+# Wayland Screen Selector (Glimpse) more Optimization TODO
 
 Performance optimizations ordered by highest to lowest impact.
 
