@@ -1,7 +1,5 @@
 # Glimpse Features TODO
 
-# Glimpse Features TODO
-
 ## Proposed File Structure
 
 src/<br>
